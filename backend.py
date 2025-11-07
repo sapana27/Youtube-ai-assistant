@@ -1,64 +1,315 @@
-from IPython.display import Image, display
-from langchain_huggingface import HuggingFaceEmbeddings # Load the  embedding model from huggingface
-from langchain_chroma import Chroma #Vectorstore to store the embedded vectors
-from langchain_community.document_loaders.csv_loader import CSVLoader #To load the csv file (data containing companys faq)
-from langchain_community.tools import DuckDuckGoSearchRun #Search user queries Online
-from langchain_groq import ChatGroq  #Load the open source Groq Models
-from langgraph.graph import StateGraph, START, END #Define the State for langgraph
-from langgraph.prebuilt import ToolNode,tools_condition #specialized node designed to execute tools within our workflow.
-from langchain_core.messages import AnyMessage #Human message or Ai Message
-from langgraph.graph.message import add_messages  ## Reducers in Langgraph ,i.e append the messages instead of replace
-from typing_extensions import Annotated,TypedDict #Annotated for labelling and TypeDict to maintain graph state 
-from langchain_core.tools import tool
-from langchain_core.messages import trim_messages # Trim the message and keep past 2 conversation
-from langgraph.checkpoint.memory import MemorySaver #Implement langgraph memory
+from langchain_huggingface import HuggingFaceEmbeddings
+from langchain_chroma import Chroma
+from langchain_community.tools import DuckDuckGoSearchRun
+from langchain_groq import ChatGroq
+from langgraph.graph import StateGraph, START, END
+from langchain_core.messages import AnyMessage
+from langgraph.graph.message import add_messages
+from typing_extensions import Annotated, TypedDict
+from langchain_core.messages import trim_messages
+from langgraph.checkpoint.memory import MemorySaver
 from langchain_core.messages import HumanMessage, AIMessage
 from youtube_transcript_api import YouTubeTranscriptApi
-from langchain.chains.query_constructor.schema import AttributeInfo
-from langchain.retrievers.self_query.base import SelfQueryRetriever
 from langchain_core.documents import Document
 from collections import defaultdict
 from datetime import timedelta
-from langchain_openai import ChatOpenAI
-from langchain_core.prompts import ChatPromptTemplate ,PromptTemplate
+from langchain_core.prompts import ChatPromptTemplate
 
 import edge_tts
-import tempfile
-from pydub import AudioSegment
-from playsound import playsound
 import asyncio
 import datetime
 import os
-
-from dotenv import load_dotenv  #Load environemnt variables from .env
-load_dotenv()
-# Create a Unique Id for each user conversation
+import requests
+from bs4 import BeautifulSoup
+import PyPDF2
+import io
+import arxiv
+from newspaper import Article
+from trafilatura import fetch_url, extract
+from langchain_text_splitters import RecursiveCharacterTextSplitter
 import uuid
 import re
 
+from dotenv import load_dotenv
+load_dotenv()
 
-embedding_model = HuggingFaceEmbeddings(model_name="sentence-transformers/paraphrase-multilingual-mpnet-base-v2") #Load the hf Embedding model
-# llm = ChatOpenAI(model='gpt-4o-mini')
-llm = ChatGroq(temperature=0.4, model_name='Llama-3.3-70b-versatile',max_tokens=3000) #Initialize the llm
-search = DuckDuckGoSearchRun()  #Duckducksearch
+# ==================== WEB CONTENT PROCESSOR ====================
 
-# Global retriever (reset per new video)
-retriever = None
+class WebContentProcessor:
+    def __init__(self):
+        self.text_splitter = RecursiveCharacterTextSplitter(
+            chunk_size=1000,
+            chunk_overlap=200
+        )
+    
+    def process_url(self, url: str):
+        """Main method to process any URL"""
+        try:
+            content_type = self._detect_content_type(url)
+            print(f"Detected content type: {content_type}")
+            
+            if content_type == "pdf":
+                return self._process_pdf(url)
+            elif content_type == "arxiv":
+                return self._process_arxiv(url)
+            elif content_type == "news":
+                return self._process_news(url)
+            else:
+                return self._process_webpage(url)
+                
+        except Exception as e:
+            raise Exception(f"Error processing URL {url}: {str(e)}")
+    
+    def _detect_content_type(self, url: str) -> str:
+        """Detect content type from URL"""
+        url_lower = url.lower()
+        
+        if url_lower.endswith('.pdf'):
+            return "pdf"
+        elif 'arxiv.org' in url_lower and '/pdf' in url_lower:
+            return "pdf"
+        elif 'arxiv.org/abs' in url_lower:
+            return "arxiv"
+        elif any(domain in url_lower for domain in ['news', 'article', 'blog', 'medium.com']):
+            return "news"
+        else:
+            return "webpage"
+    
+    def _process_pdf(self, url: str):
+        """Process PDF documents"""
+        try:
+            headers = {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+            }
+            response = requests.get(url, headers=headers, timeout=30)
+            response.raise_for_status()
+            
+            pdf_file = io.BytesIO(response.content)
+            pdf_reader = PyPDF2.PdfReader(pdf_file)
+            
+            documents = []
+            for page_num in range(len(pdf_reader.pages)):
+                page = pdf_reader.pages[page_num]
+                content = page.extract_text()
+                
+                if content.strip():
+                    doc = Document(
+                        page_content=content,
+                        metadata={
+                            "source": url,
+                            "page": page_num + 1,
+                            "content_type": "pdf",
+                            "total_pages": len(pdf_reader.pages)
+                        }
+                    )
+                    documents.append(doc)
+            
+            return self.text_splitter.split_documents(documents)
+            
+        except Exception as e:
+            raise Exception(f"PDF processing failed: {str(e)}")
+    
+    def _process_arxiv(self, url: str):
+        """Process ArXiv research papers"""
+        try:
+            # Extract arXiv ID from URL
+            arxiv_id = url.split('/')[-1].replace('.pdf', '')
+            
+            search = arxiv.Search(id_list=[arxiv_id])
+            paper = next(search.results())
+            
+            content = f"""
+TITLE: {paper.title}
+
+AUTHORS: {', '.join(str(author) for author in paper.authors)}
+
+ABSTRACT: {paper.summary}
+
+PUBLISHED: {paper.published}
+CATEGORIES: {', '.join(paper.categories)}
+"""
+            
+            doc = Document(
+                page_content=content,
+                metadata={
+                    "source": url,
+                    "content_type": "research_paper",
+                    "arxiv_id": arxiv_id,
+                    "title": paper.title,
+                    "authors": [str(author) for author in paper.authors],
+                    "published": paper.published.isoformat(),
+                    "categories": paper.categories
+                }
+            )
+            
+            return self.text_splitter.split_documents([doc])
+            
+        except Exception as e:
+            raise Exception(f"ArXiv processing failed: {str(e)}")
+    
+    def _process_news(self, url: str):
+        """Process news articles"""
+        try:
+            article = Article(url)
+            article.download()
+            article.parse()
+            article.nlp()
+            
+            content = f"""
+TITLE: {article.title}
+
+AUTHORS: {', '.join(article.authors) if article.authors else 'Unknown'}
+
+PUBLISH DATE: {article.publish_date}
+
+SUMMARY: {article.summary}
+
+FULL TEXT: {article.text}
+"""
+            
+            doc = Document(
+                page_content=content,
+                metadata={
+                    "source": url,
+                    "content_type": "news",
+                    "title": article.title,
+                    "authors": article.authors,
+                    "publish_date": str(article.publish_date),
+                    "keywords": article.keywords
+                }
+            )
+            
+            return self.text_splitter.split_documents([doc])
+            
+        except Exception as e:
+            # Fallback to general webpage processing
+            return self._process_webpage(url)
+    
+    def _process_webpage(self, url: str):
+        """Process general webpages"""
+        try:
+            # First try with trafilatura (clean extraction)
+            downloaded = fetch_url(url)
+            if downloaded:
+                content = extract(downloaded)
+                if content:
+                    doc = Document(
+                        page_content=content,
+                        metadata={
+                            "source": url,
+                            "content_type": "webpage",
+                            "extraction_method": "trafilatura"
+                        }
+                    )
+                    return self.text_splitter.split_documents([doc])
+            
+            # Fallback to BeautifulSoup
+            headers = {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+            }
+            response = requests.get(url, headers=headers, timeout=30)
+            response.raise_for_status()
+            
+            soup = BeautifulSoup(response.content, 'html.parser')
+            
+            # Remove script and style elements
+            for script in soup(["script", "style"]):
+                script.decompose()
+            
+            # Get text and clean it
+            text = soup.get_text()
+            lines = (line.strip() for line in text.splitlines())
+            chunks = (phrase.strip() for line in lines for phrase in line.split("  "))
+            text = ' '.join(chunk for chunk in chunks if chunk)
+            
+            doc = Document(
+                page_content=text,
+                metadata={
+                    "source": url,
+                    "content_type": "webpage", 
+                    "extraction_method": "beautifulsoup"
+                }
+            )
+            
+            return self.text_splitter.split_documents([doc])
+            
+        except Exception as e:
+            raise Exception(f"Webpage processing failed: {str(e)}")
+
+# ==================== CONTENT MANAGER ====================
+
+class ContentManager:
+    def __init__(self, embedding_model):
+        self.embedding_model = embedding_model
+        self.web_processor = WebContentProcessor()
+        self.vectorstores = {}
+        self.retrievers = {}
+    
+    def load_web_content(self, url: str):
+        """Load web content and create vector store"""
+        try:
+            # Process content
+            documents = self.web_processor.process_url(url)
+            
+            # Create unique collection name
+            content_id = str(uuid.uuid4())[:8]
+            collection_name = f"web_{content_id}"
+            
+            # Create vector store
+            vectorstore = Chroma(
+                collection_name=collection_name,
+                embedding_function=self.embedding_model
+            )
+            
+            vectorstore.add_documents(documents)
+            
+            # Create retriever
+            retriever = vectorstore.as_retriever(
+                search_type="mmr",
+                search_kwargs={"k": 6, "lambda_mult": 0.3}
+            )
+            
+            # Store references
+            self.vectorstores[url] = vectorstore
+            self.retrievers[url] = retriever
+            
+            return True, f"Successfully loaded content from {url}"
+            
+        except Exception as e:
+            return False, f"Error loading web content: {str(e)}"
+    
+    def get_retriever(self, url: str):
+        """Get retriever for specific URL"""
+        return self.retrievers.get(url)
+    
+    def get_all_sources(self):
+        """Get list of all loaded content sources"""
+        return list(self.retrievers.keys())
+
+# ==================== INITIALIZE COMPONENTS ====================
+
+embedding_model = HuggingFaceEmbeddings(model_name="sentence-transformers/paraphrase-multilingual-mpnet-base-v2")
+llm = ChatGroq(temperature=0.4, model_name='Llama-3.3-70b-versatile',max_tokens=3000)
+search = DuckDuckGoSearchRun()
+
+# Global variables
+youtube_retriever = None
+content_manager = ContentManager(embedding_model)
+
+# ==================== YOUTUBE PROCESSING ====================
 
 def process_youtube_video(youtube_url: str, language: str = "en"):
     """Fetch transcript of a YouTube video and create an in-memory vectorstore."""
-
-    global retriever
-    # print(youtube_url)
+    global youtube_retriever
 
     # Extract video id
     video_id = youtube_url.split("v=")[-1].split("&")[0]
 
-    # Create a temporary vector store (in-memory, no persistence)
+    # Create a temporary vector store
     vectorstore = Chroma(
         collection_name=video_id,
         embedding_function=embedding_model,
-        persist_directory=None  # ensures it is NOT saved permanently
+        persist_directory=None
     )
 
     documents = []
@@ -100,53 +351,34 @@ def process_youtube_video(youtube_url: str, language: str = "en"):
         # Add to vectorstore
         vectorstore.add_documents(documents)
 
-        # Create retriever for QA
-        metadata_field_info = [
-            {"name": "start_timestamp", "description": "Video start timestamp", "type": "string"},
-            {"name": "minute", "description": "Minute of video", "type": "integer"},
-        ]
+        # Create simple retriever
+        youtube_retriever = vectorstore.as_retriever(
+            search_type="mmr",
+            search_kwargs={"k": 20, "lambda_mult": 0.3}
+        )
 
-        base_retriever = vectorstore.as_retriever(search_type="mmr", search_kwargs={"k": 20, "lambda_mult": 0.3})
-
-        document_content_description = "Transcript of a youtube video"
-        retriever = SelfQueryRetriever.from_llm(
-                    llm,
-                    vectorstore,
-                    document_content_description,
-                    metadata_field_info,
-                    base_retriever = base_retriever,
-                    verbose=True,
-                    search_kwargs={"k": 20} 
-                )
+        return True
 
     except Exception as e:
         print(f"Error fetching transcript: {e}")
-        retriever = None
+        youtube_retriever = None
+        return False
 
-# Audio Generation Setup
-VOICES = [
-    'en-AU-NatashaNeural', 'en-AU-WilliamNeural', 'en-CA-ClaraNeural', 'en-CA-LiamNeural',
-    'en-GB-LibbyNeural', 'en-GB-MaisieNeural', 'en-IN-NeerjaNeural',
-    "en-US-AvaNeural", "en-US-EmmaNeural", "en-US-AndrewMultilingualNeural",
-    "en-US-AriaNeural", "en-US-AvaMultilingualNeural", "en-US-BrianMultilingualNeural",
-    "en-US-ChristopherNeural", "en-US-EmmaMultilingualNeural", 'en-US-EricNeural'
-]
+# ==================== AUDIO GENERATION ====================
 
-VOICE = VOICES[9]  # en-US-AriaNeural
+VOICE = "en-US-AriaNeural"
 
 # Output directory
 output_dir = "./output"
 os.makedirs(output_dir, exist_ok=True)
 
-# Async function to generate audio for each response
 async def _generate_audio_files(text):
     """Generate unique audio file for text response."""
-    # Generate unique filename based on datetime
     timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S_%f")
     filename = os.path.join(output_dir, f"audio_{timestamp}.mp3")
     
     # Clean text for better TTS synthesis
-    cleaned_text = text.lower().strip()
+    cleaned_text = text.strip()
     
     try:
         communicate = edge_tts.Communicate(cleaned_text, VOICE, rate='+0%', pitch="+1Hz")
@@ -161,27 +393,23 @@ def generate_audio_files(text):
     """Synchronous wrapper for audio generation."""
     return asyncio.run(_generate_audio_files(text))
 
+# ==================== LANGGRAPH STATE & WORKFLOW ====================
+
 from pydantic import BaseModel,Field
 from typing import Literal 
 
 class Routequery(BaseModel):
-    decision : Literal["general_query","video_qa"] = Field(...,description="Given a user question choose to route to `general_query` for greetings and general conversation, or `video_qa` for video analysis and Q&A")
-
-from typing_extensions import TypedDict
-from typing import List
-from langchain_core.messages import BaseMessage
+    decision : Literal["general_query","video_qa", "web_content"] = Field(
+        ..., 
+        description="Given a user question choose to route to `general_query` for greetings, `video_qa` for video analysis, or `web_content` for web content analysis"
+    )
 
 class State(TypedDict):
-    """Represents the state of our graph
-    
-    Attributes:
-    messages : All the messages in our graph, including AIMessage, HumanMessage.
-    audio_file : Path to generated audio file for the latest response.
-    generate_audio : Whether to generate audio for responses.
-    """
-    messages: Annotated[list[BaseMessage], add_messages] #List of messages appended
-    audio_file: str = None  # Path to the generated audio file
-    generate_audio: bool = False  # Whether to generate audio
+    """Represents the state of our graph"""
+    messages: Annotated[list[AnyMessage], add_messages]
+    audio_file: str = None
+    generate_audio: bool = False
+    current_source: str = None  # Track which content source we're using
 
 def is_greeting_or_general(text: str) -> bool:
     """Check if the text is a general greeting, casual inquiry, or non-video related query."""
@@ -201,8 +429,8 @@ def is_greeting_or_general(text: str) -> bool:
     text_lower = text.lower().strip()
     return any(re.search(pattern, text_lower, re.IGNORECASE) for pattern in general_patterns)
 
-# Router Setup
-system_msg_router = """You are an expert at routing user queries for a YouTube video analysis system.
+# Enhanced Router Setup
+system_msg_router = """You are an expert at routing user queries for a content analysis system.
 
 Analyze the user's message and route it appropriately:
 
@@ -210,18 +438,22 @@ Analyze the user's message and route it appropriately:
    - General greetings (like "hi", "hello", "how are you", etc.)
    - Casual conversation or small talk
    - Questions about the system's capabilities
-   - Non-video related queries
-   - General questions that don't require video transcript analysis
+   - General questions that don't require specific content analysis
 
 2. **video_qa**: Route here if the user query is:
    - Asking for video summaries or analysis
    - Specific questions about video content
    - Timestamp-related queries
-   - Content explanations from the video
-   - Any analytical questions about the video transcript
-   - Requests for information that would be found in a video
+   - Content explanations from videos
+   - Any analytical questions about video transcripts
 
-Choose the most appropriate route based on the user's intent."""
+3. **web_content**: Route here if the user query is:
+   - About research papers, articles, or web content
+   - Asking for analysis of documents, PDFs, or web pages
+   - Questions about news articles or blog posts
+   - Requests for information from loaded web content
+
+Choose the most appropriate route based on the user's intent and available content sources."""
 
 template_route = ChatPromptTemplate([
     ("system", system_msg_router),
@@ -230,22 +462,36 @@ template_route = ChatPromptTemplate([
 structured_llm_router = llm.with_structured_output(Routequery)
 chain_router = template_route | structured_llm_router
 
-def route_query(state: State) -> dict:
-    """Route question to appropriate handler.
-    
-    Arguments:
-        state(dict) : Current graph state.
-
-    Returns:
-        dict : Update adding the intent of the user.
-    """
+def enhanced_route_query(state: State) -> dict:
+    """Enhanced router that detects content type from queries and available sources."""
     user_msg = next(msg for msg in reversed(state["messages"]) if isinstance(msg, HumanMessage))
+    current_source = state.get("current_source")
+    
+    # If we have a current source, route to appropriate handler
+    if current_source:
+        if "youtube.com" in current_source or "youtu.be" in current_source:
+            return {"decision": "video_qa"}
+        else:
+            return {"decision": "web_content"}
     
     # First check if it's a simple greeting using regex
     if is_greeting_or_general(user_msg.content):
         return {"decision": "general_query"}
     
-    # Use LLM for more complex routing
+    # Check query content for hints
+    query = user_msg.content.lower()
+    
+    # Video-related queries
+    video_keywords = ["video", "youtube", "timestamp", "minute", "second", "watch", "view"]
+    if any(keyword in query for keyword in video_keywords):
+        return {"decision": "video_qa"}
+    
+    # Web content related queries
+    web_keywords = ["pdf", "article", "research", "paper", "blog", "webpage", "website", "document"]
+    if any(keyword in query for keyword in web_keywords):
+        return {"decision": "web_content"}
+    
+    # Use LLM for complex routing
     intent = chain_router.invoke({"question": user_msg.content})
     return {"decision": intent.decision}
 
@@ -262,18 +508,18 @@ def handle_general_query(state: State) -> State:
         for msg in messages[:-1]  # Exclude current message
     )
     
-    general_system_msg = """You are a friendly AI assistant specialized in YouTube video analysis and content generation. 
+    general_system_msg = """You are a friendly AI assistant specialized in content analysis.
 
 Your capabilities include:
 - Analyzing YouTube video transcripts and providing detailed summaries
-- Answering specific questions about video content with precise timestamps
+- Answering questions about research papers, news articles, and web content
 - Engaging in general conversation and providing helpful information
-- Assisting with various queries beyond video analysis
+- Assisting with various queries beyond content analysis
 
 When responding to general queries, greetings, or casual conversation:
 - Be warm, friendly, and helpful
 - Provide informative and engaging responses
-- If discussing your capabilities, mention your YouTube video analysis features
+- If discussing your capabilities, mention your content analysis features
 - Keep responses conversational and natural
 - Be concise but comprehensive in your explanations
 - Show enthusiasm for helping with their requests
@@ -334,9 +580,9 @@ Guidelines:
     user_msg = next(msg for msg in reversed(messages) if isinstance(msg, HumanMessage))
     
     # Check if retriever is available
-    global retriever
-    if retriever is None:
-        error_response = AIMessage(content="I'm sorry, but I need a YouTube video transcript to be loaded first before I can analyze video content. Please provide a YouTube URL and process it using the `process_youtube_video()` function.")
+    global youtube_retriever
+    if youtube_retriever is None:
+        error_response = AIMessage(content="I'm sorry, but I need a YouTube video transcript to be loaded first before I can analyze video content. Please provide a YouTube URL and process it using the video loading function.")
         return {
             "messages": messages + [error_response],
             "audio_file": None
@@ -344,7 +590,7 @@ Guidelines:
     
     # Get transcript context
     try:
-        result = retriever.invoke(user_msg.content)
+        result = youtube_retriever.invoke(user_msg.content)
         context_docs = []
         for doc in result:
             metadata = doc.metadata
@@ -393,51 +639,139 @@ Guidelines:
         "audio_file": audio_file
     }
 
-# Build the workflow with 2 nodes
-from langgraph.graph import END, START, StateGraph
-from langgraph.checkpoint.memory import MemorySaver
+def handle_web_content(state: State) -> State:
+    """Handle web content Q&A with conditional audio generation."""
+    
+    system_msg_web = """You are a helpful assistant that analyzes web content, research papers, news articles, and documents.
+
+Your tasks:
+- Provide clear, detailed summaries or answers based on the provided content
+- For research papers, focus on methodology, findings, and implications
+- For news articles, extract key facts, events, and context
+- For PDF documents, provide comprehensive overviews and key insights
+- For general web content, provide well-structured summaries
+
+Guidelines:
+- Always use only the provided content for your answers
+- Keep your tone informative and engaging
+- Structure longer responses with clear organization
+- Be honest about limitations in the available content
+- For research papers, highlight key contributions and methodology
+- For news, focus on factual reporting and context"""
+
+    messages = state["messages"]
+    generate_audio = state.get("generate_audio", False)
+    current_source = state.get("current_source")
+    
+    # Get last human message
+    user_msg = next(msg for msg in reversed(messages) if isinstance(msg, HumanMessage))
+    
+    # Check if we have a content source
+    if not current_source:
+        error_response = AIMessage(content="Please load a web content source first using the web content loading function.")
+        return {
+            "messages": messages + [error_response],
+            "audio_file": None,
+            "current_source": None
+        }
+    
+    # Get retriever for current source
+    retriever = content_manager.get_retriever(current_source)
+    if not retriever:
+        error_response = AIMessage(content="No web content source is currently active. Please load web content first.")
+        return {
+            "messages": messages + [error_response],
+            "audio_file": None,
+            "current_source": None
+        }
+    
+    # Get relevant context
+    try:
+        result = retriever.invoke(user_msg.content)
+        context_docs = []
+        
+        for doc in result:
+            metadata = doc.metadata
+            content_type = metadata.get("content_type", "webpage")
+            source = metadata.get("source", "Unknown")
+            
+            context_docs.append(f"SOURCE: {source}\nTYPE: {content_type}\nCONTENT: {doc.page_content}")
+
+        context = "\n\n---\n\n".join(context_docs)
+        
+        # Prepare conversation history
+        conversation_history = "\n".join(
+            f"{'User' if isinstance(msg, HumanMessage) else 'Assistant'}: {msg.content}"
+            for msg in messages[:-1]
+        )
+
+        template_web_response = ChatPromptTemplate.from_messages([
+            ("system", system_msg_web),
+            ("human", f"Conversation History:\n{conversation_history}\n\n"
+                     f"Current Question: {user_msg.content}\n\n"
+                     f"Content Context:\n{context}")
+        ])
+
+        chain_web_response = template_web_response | llm
+        response = chain_web_response.invoke({})
+        
+    except Exception as e:
+        print(f"Error processing web content query: {e}")
+        response = AIMessage(content=f"I encountered an error while processing your query: {str(e)}")
+    
+    # Generate audio if requested
+    audio_file = None
+    if generate_audio:
+        try:
+            audio_file = generate_audio_files(response.content)
+            print(f"Generated audio for web content: {audio_file}")
+        except Exception as e:
+            print(f"Error generating audio for web content: {e}")
+    else:
+        print("Audio generation skipped for web content (auto-play disabled)")
+    
+    return {
+        "messages": messages + [response],
+        "audio_file": audio_file,
+        "current_source": current_source
+    }
+
+# ==================== BUILD WORKFLOW ====================
 
 checkpointer = MemorySaver()
 workflow = StateGraph(State)
 
-# Add the two main nodes
-workflow.add_node("route_query", route_query)
+# Add nodes
+workflow.add_node("route_query", enhanced_route_query)
 workflow.add_node("handle_general_query", handle_general_query)
 workflow.add_node("handle_video_qa", handle_video_qa)
+workflow.add_node("handle_web_content", handle_web_content)
 
 # Set entry point to router
 workflow.set_entry_point("route_query")
 
-# Add conditional edges from router to the two main nodes
+# Add conditional edges from router to the handlers
 workflow.add_conditional_edges(
     "route_query",
     lambda state: state.get("decision", "general_query"),
     {
         "general_query": "handle_general_query",
-        "video_qa": "handle_video_qa"
+        "video_qa": "handle_video_qa",
+        "web_content": "handle_web_content"
     }
 )
 
 # Add edges from each node to END
 workflow.add_edge("handle_general_query", END)
 workflow.add_edge("handle_video_qa", END)
+workflow.add_edge("handle_web_content", END)
 
 # Compile the app
 app = workflow.compile(checkpointer=checkpointer)
 
-# Generate and display the graph
-try:
-    graph_image = app.get_graph().draw_mermaid_png()
-    display(Image(graph_image))
-    # Save graph to file
-    with open("workflow_graph.png", "wb") as f:
-        f.write(graph_image)
-    print("Workflow graph saved as 'workflow_graph.png'")
-except Exception as e:
-    print(f"Could not generate graph visualization: {e}")
-
-print("YouTube Video Analysis Workflow is ready!")
-print("\nThe workflow has two main capabilities:")
+print("Enhanced Content Analysis Workflow is ready!")
+print("\nThe workflow has three main capabilities:")
 print("1. General Query Handler - For greetings, casual conversation, and general questions")
-print("2. Video Q&A Handler - For video analysis, summarization, and content-based questions")
-print("3. Audio files are conditionally generated based on user preference")
+print("2. Video Q&A Handler - For video analysis, summarization, and content-based questions") 
+print("3. Web Content Handler - For research papers, news articles, PDFs, and web content")
+print("4. Audio files are conditionally generated based on user preference")
