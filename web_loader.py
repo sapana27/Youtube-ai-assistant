@@ -19,8 +19,7 @@ class WebContentProcessor:
             chunk_size=1000,
             chunk_overlap=200
         )
-    
-    def process_url(self, url: str):
+        def process_url(self, url: str):
         """Main method to process any URL"""
         try:
             content_type = self._detect_content_type(url)
