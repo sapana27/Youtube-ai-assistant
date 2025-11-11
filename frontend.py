@@ -4,7 +4,6 @@ from streamlit_mic_recorder import speech_to_text
 from langchain_core.messages import HumanMessage, AIMessage
 import os
 import uuid
-
 # Initialize session state
 if "message_history" not in st.session_state:
     st.session_state['message_history'] = []
